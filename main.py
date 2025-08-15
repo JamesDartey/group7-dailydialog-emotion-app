@@ -20,7 +20,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix,
     roc_auc_score, roc_curve, auc
 )
-from sklearn.utils.class_weight import compute_class_weight  # <-- NEW
+from sklearn.utils.class_weight import compute_class_weight  # imbalanced handling
 import joblib
 
 # Plots
@@ -271,7 +271,7 @@ def predict_with_glove(text: str, model, glove_dim=100):
 # Streamlit App
 # -----------------------------
 def run_app():
-    st.set_page_config(page_title="DailyDialog Emotion Classifier (Local JSON)", page_icon="🧠", layout="wide")
+    st.set_page_config(page_title="DailyDialog Emotion Classifier (Local JSON)", layout="wide")
     st.title("DailyDialog Emotion Detection • GloVe + LR / ANN")
     st.caption(" A JSON data in ./data/dialogues.json, Comparing Logistic Regression and ANN.")
 
