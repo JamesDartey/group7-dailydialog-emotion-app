@@ -118,6 +118,8 @@ def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
             # Normalize emotion to int id
             if isinstance(emo_val, int):
                 emo_id = int(emo_val)
+                if emo_id == -1:            # <-- explicit -1 handling
+                    emo_id = 0
                 if emo_id not in ID_TO_EMOTION:
                     emo_id = 0
             else:
@@ -321,6 +323,7 @@ def run_app():
     except Exception as e:
         st.error(str(e))
         st.stop()
+    st.caption(f"Loaded {len(df)} utterances from {data_path}")
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -328,7 +331,15 @@ def run_app():
     with c2:
         st.metric("Total utterances", len(df))
         counts = pd.Series(df["emotion"]).map(ID_TO_EMOTION).value_counts().reindex(EMOTIONS, fill_value=0)
-        st.bar_chart(counts)
+
+        chart_type = st.selectbox("Class distribution chart", ["Bar", "Pie"], index=1)
+        if chart_type == "Bar":
+            st.bar_chart(counts)
+        else:
+            fig, ax = plt.subplots()
+            ax.pie(counts.values, labels=counts.index, autopct="%1.1f%%", startangle=90)
+            ax.axis("equal")
+            st.pyplot(fig)
 
     # Embeddings
     st.header("2) Build GloVe Embeddings")
