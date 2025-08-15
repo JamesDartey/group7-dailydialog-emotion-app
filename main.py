@@ -31,9 +31,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 from tensorflow import keras
 from tensorflow.keras import layers
 
-# NEW: oversampling
-from imblearn.over_sampling import RandomOverSampler
-
 # preparing path for github and streamlit
 from pathlib import Path
 
@@ -121,7 +118,7 @@ def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
             # Normalize emotion to int id
             if isinstance(emo_val, int):
                 emo_id = int(emo_val)
-                if emo_id == -1:            # explicit -1 handling
+                if emo_id == -1:            # <-- explicit -1 handling
                     emo_id = 0
                 if emo_id not in ID_TO_EMOTION:
                     emo_id = 0
@@ -170,32 +167,6 @@ def undersample_majority(X, y, majority_class=0, k=1.5, random_state=42):
 
     return X[keep], y[keep]
 
-def rebalance_train(X, y, use_under: bool, k: float, use_over: bool,
-                    majority_class: int = 0, random_state: int = 42):
-    """
-    Optionally undersample majority, then oversample minorities to balance.
-    """
-    Xb, yb = (X, y)
-    if use_under:
-        Xb, yb = undersample_majority(Xb, yb, majority_class=majority_class, k=k, random_state=random_state)
-    if use_over:
-        ros = RandomOverSampler(sampling_strategy="not majority", random_state=random_state)
-        Xb, yb = ros.fit_resample(Xb, yb)
-    return Xb, yb
-
-def apply_neutral_penalty(y_prob: np.ndarray, penalty: float) -> np.ndarray:
-    """
-    Shrink the no_emotion (class 0) probability by 'penalty' before argmax and renormalize.
-    penalty=1.0 means no change.
-    """
-    if penalty is None or penalty <= 1.0:
-        return y_prob
-    yp = y_prob.copy()
-    yp[:, 0] = yp[:, 0] / penalty
-    s = yp.sum(axis=1, keepdims=True)
-    s[s == 0] = 1.0
-    return yp / s
-
 # -----------------------------
 # Models
 # -----------------------------
@@ -242,10 +213,8 @@ def train_ann(X_train, y_train, X_val, y_val, epochs=12, batch_size=128, hidden=
 # -----------------------------
 # Model Evaluation helpers
 # -----------------------------
-def evaluate_classifier(name, clf, X_test, y_test, neutral_penalty: float = 1.0):
-    y_prob_raw = clf.predict_proba(X_test)
-    # Apply penalty only for predicted labels (keeps AUC on raw probs)
-    y_prob = apply_neutral_penalty(y_prob_raw, neutral_penalty)
+def evaluate_classifier(name, clf, X_test, y_test):
+    y_prob = clf.predict_proba(X_test)
     y_pred = np.argmax(y_prob, axis=1)
 
     report = classification_report(
@@ -259,8 +228,8 @@ def evaluate_classifier(name, clf, X_test, y_test, neutral_penalty: float = 1.0)
     lb = LabelBinarizer().fit(list(range(len(EMOTIONS))))
     y_test_bin = lb.transform(y_test)
     try:
-        auc_macro = roc_auc_score(y_test_bin, y_prob_raw, average="macro", multi_class="ovr")
-        auc_micro = roc_auc_score(y_test_bin, y_prob_raw, average="micro", multi_class="ovr")
+        auc_macro = roc_auc_score(y_test_bin, y_prob, average="macro", multi_class="ovr")
+        auc_micro = roc_auc_score(y_test_bin, y_prob, average="micro", multi_class="ovr")
     except ValueError:
         auc_macro, auc_micro = np.nan, np.nan
 
@@ -271,7 +240,7 @@ def evaluate_classifier(name, clf, X_test, y_test, neutral_penalty: float = 1.0)
         "auc_macro": auc_macro,
         "auc_micro": auc_micro,
         "cm": cm,
-        "y_prob": y_prob,          # penalized (matches predictions)
+        "y_prob": y_prob,
         "y_pred": y_pred,
     }
 
@@ -316,12 +285,11 @@ def plot_roc_curves(y_test, y_prob, title):
 # -----------------------------
 # Inference helper
 # -----------------------------
-def predict_with_glove(text: str, model, glove_dim=100, neutral_penalty: float = 1.0):
+def predict_with_glove(text: str, model, glove_dim=100):
     glove = load_glove(glove_dim)
     toks = simple_tokenize(text)
     vec = sentence_to_glove(toks, glove, dim=glove_dim).reshape(1, -1)
     probs = model.predict_proba(vec)
-    probs = apply_neutral_penalty(probs, neutral_penalty)
     idx = int(np.argmax(probs))
     return probs.flatten(), EMOTIONS[idx]
 
@@ -340,7 +308,7 @@ def run_app():
 **Classes:** no_emotion, anger, disgust, fear, happiness, sadness, surprise  
 **Embeddings:** GloVe (glove-wiki-gigaword) averaged per sentence  
 **Metrics:** Precision, Recall, F1, ROC-AUC (macro, micro)  
-**Imbalance:** Class weights, undersampling, optional oversampling, and neutral penalty  
+**Imbalance:** Class weights and optional undersampling of `no_emotion`  
 """
         )
 
@@ -400,15 +368,13 @@ def run_app():
         pretty = {ID_TO_EMOTION[k]: f"{v:.2f}" for k, v in cw.items()}
         st.caption(f"Class weights: {pretty}")
 
-    use_under = st.checkbox("Undersample 'no_emotion' in training", value=True)
-    k_ratio   = st.slider("Cap no_emotion at k × largest minority", 0.5, 3.0, 1.0, 0.5)
-    use_over  = st.checkbox("Oversample minorities (after undersampling)", value=True)
+    use_under = st.checkbox("Undersample 'no_emotion' in training", value=False)
+    k_ratio = st.slider("Cap no_emotion at k × largest minority", 1.0, 3.0, 1.5, 0.5)
 
-    X_tr_bal, y_tr_bal = rebalance_train(X_train, y_train, use_under, k_ratio, use_over)
-    counts_bal = pd.Series(y_tr_bal).map(ID_TO_EMOTION).value_counts().reindex(EMOTIONS, fill_value=0)
-    st.caption(f"Balanced train counts: {counts_bal.to_dict()}")
-
-    neutral_pen = st.slider("Neutral penalty at prediction (1.0 = none)", 1.0, 3.0, 1.2, 0.1)
+    X_tr_bal, y_tr_bal = (X_train, y_train)
+    if use_under:
+        X_tr_bal, y_tr_bal = undersample_majority(X_train, y_train, majority_class=0, k=k_ratio)
+        st.caption(f"After undersampling: Train = {len(y_tr_bal)} (no_emotion capped at ~{k_ratio}× largest minority)")
 
     # Train models
     st.header("4) Train Models")
@@ -449,13 +415,13 @@ def run_app():
             with tab:
                 if mname == "logreg":
                     clf = st.session_state["logreg"]
-                    metrics = evaluate_classifier("LogReg", clf, X_test, y_test, neutral_penalty=neutral_pen)
+                    metrics = evaluate_classifier("LogReg", clf, X_test, y_test)
                 else:
                     class KerasWrap:
                         def __init__(self, model): self.model = model
                         def predict_proba(self, X): return self.model.predict(X, verbose=0)
                     clf = KerasWrap(st.session_state["ann"])
-                    metrics = evaluate_classifier("ANN", clf, X_test, y_test, neutral_penalty=neutral_pen)
+                    metrics = evaluate_classifier("ANN", clf, X_test, y_test)
 
                 # Summary
                 st.subheader("Summary metrics")
@@ -489,7 +455,7 @@ def run_app():
                 fig_cm = plot_confusion_matrix(metrics["cm"], f"{metrics['name']} — Confusion Matrix")
                 st.pyplot(fig_cm)
 
-                # ROC curves (use penalized probs to match confusion matrix curves)
+                # ROC curves
                 st.write("ROC curves (one-vs-rest)")
                 fig_roc = plot_roc_curves(y_test, metrics["y_prob"], f"{metrics['name']} — ROC by Class")
                 st.pyplot(fig_roc)
@@ -506,7 +472,7 @@ def run_app():
             if "logreg" not in st.session_state:
                 st.warning("Train Logistic Regression first.")
             else:
-                probs, top = predict_with_glove(headline, st.session_state["logreg"], glove_dim=glove_dim, neutral_penalty=neutral_pen)
+                probs, top = predict_with_glove(headline, st.session_state["logreg"], glove_dim=glove_dim)
                 st.write("Top emotion:", f"**{top}**")
                 st.bar_chart(pd.Series(probs, index=EMOTIONS))
         else:
@@ -515,9 +481,7 @@ def run_app():
             else:
                 glove = load_glove(glove_dim)
                 vec = sentence_to_glove(simple_tokenize(headline), glove, dim=glove_dim).reshape(1, -1)
-                probs = st.session_state["ann"].predict(vec, verbose=0)
-                probs = apply_neutral_penalty(probs, neutral_penalty=neutral_pen)
-                probs = probs.flatten()
+                probs = st.session_state["ann"].predict(vec, verbose=0).flatten()
                 top = EMOTIONS[int(np.argmax(probs))]
                 st.write("Top emotion:", f"**{top}**")
                 st.bar_chart(pd.Series(probs, index=EMOTIONS))
@@ -550,15 +514,15 @@ def run_cli():
     cw = get_class_weights(ytr)
     print("Class weights:", cw)
 
-    # Rebalance: undersample then oversample
-    Xtr_bal, ytr_bal = rebalance_train(Xtr, ytr, use_under=True, k=1.0, use_over=True)
-    print(f"CLI rebalanced: train size {len(ytr)} -> {len(ytr_bal)}")
+    # Optional undersampling in CLI as well (fixed k=1.5 for consistency)
+    Xtr_bal, ytr_bal = undersample_majority(Xtr, ytr, majority_class=0, k=1.5)
+    print(f"CLI undersampling: train size {len(ytr)} -> {len(ytr_bal)}")
 
     # Logistic Regression
     print("Training Logistic Regression...")
     lr = train_logreg(Xtr_bal, ytr_bal, C=2.0, class_weight=cw)
     yprob_lr = lr.predict_proba(Xte)
-    ypred_lr = np.argmax(apply_neutral_penalty(yprob_lr, 1.2), axis=1)  # light penalty in CLI eval
+    ypred_lr = np.argmax(yprob_lr, axis=1)
     rep_lr = classification_report(yte, ypred_lr, target_names=EMOTIONS, zero_division=0, output_dict=True)
     lb = LabelBinarizer().fit(list(range(7)))
     auc_lr = roc_auc_score(lb.transform(yte), yprob_lr, average="macro", multi_class="ovr")
@@ -569,7 +533,7 @@ def run_cli():
     print("Training ANN...")
     ann, _ = train_ann(Xtr_bal, ytr_bal, Xte[:len(Xte)//5], yte[:len(yte)//5], epochs=12, batch_size=128, class_weight=cw)
     yprob_nn = ann.predict(Xte, verbose=0)
-    ypred_nn = np.argmax(apply_neutral_penalty(yprob_nn, 1.2), axis=1)
+    ypred_nn = np.argmax(yprob_nn, axis=1)
     rep_nn = classification_report(yte, ypred_nn, target_names=EMOTIONS, zero_division=0, output_dict=True)
     auc_nn = roc_auc_score(lb.transform(yte), yprob_nn, average="macro", multi_class="ovr")
     print(f"ANN   Macro F1: {rep_nn['macro avg']['f1-score']:.3f}  Macro AUC: {auc_nn:.3f}")
