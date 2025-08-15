@@ -1,4 +1,3 @@
-
 import os
 import re
 import string
@@ -21,6 +20,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix,
     roc_auc_score, roc_curve, auc
 )
+from sklearn.utils.class_weight import compute_class_weight  # <-- NEW
 import joblib
 
 # Plots
@@ -33,13 +33,12 @@ from tensorflow.keras import layers
 
 # preparing path for github and streamlit
 from pathlib import Path
+
 # -----------------------------
 # Paths & constants
 # -----------------------------
-
 DATA_DIR = Path(__file__).parent / "data"
 DIALOGUES_JSON = DATA_DIR / "dialogues.json"
-
 
 # Canonical emotion set (7 classes)
 EMOTION_TO_ID = {
@@ -99,21 +98,7 @@ def build_embeddings(df: pd.DataFrame, glove_dim=100):
 def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
     """
     Load DailyDialog from a local dialogues.json created from the dataset.
-    Expected structure (typical):
-      [
-        {
-          "data_split": "train" | "validation" | "test",
-          "turns": [
-            {"utterance": "...", "emotion": "happiness" | 4 | ... },
-            ...
-          ]
-        },
-        ...
-      ]
-
-    We output a DataFrame with columns:
-      text: str  (utterance)
-      emotion: int in [0..6] using our canonical mapping
+    Output: DataFrame with columns: text (str), emotion (int 0..6)
     """
     if not os.path.isfile(json_path):
         raise FileNotFoundError(
@@ -132,12 +117,10 @@ def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
 
             # Normalize emotion to int id
             if isinstance(emo_val, int):
-                # already id-like; clamp to [0..6] just in case you are asking
                 emo_id = int(emo_val)
                 if emo_id not in ID_TO_EMOTION:
                     emo_id = 0
             else:
-                # string label; normalize and map
                 key = str(emo_val).strip().lower()
                 emo_id = EMOTION_TO_ID.get(key, 0)
 
@@ -150,15 +133,25 @@ def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 # -----------------------------
+# Imbalance helpers (NEW)
+# -----------------------------
+def get_class_weights(y_train):
+    """Compute sklearn-style class weights as a dict {class_id: weight}."""
+    classes = np.unique(y_train)
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+    return {int(c): float(w) for c, w in zip(classes, weights)}
+
+# -----------------------------
 # Models
 # -----------------------------
-def train_logreg(X_train, y_train, C=2.0, max_iter=2000, random_state=42):
+def train_logreg(X_train, y_train, C=2.0, max_iter=2000, random_state=42, class_weight=None):
     clf = LogisticRegression(
         C=C,
         max_iter=max_iter,
         multi_class="multinomial",
         solver="lbfgs",
-        random_state=random_state
+        random_state=random_state,
+        class_weight=class_weight  # <-- NEW
     )
     clf.fit(X_train, y_train)
     return clf
@@ -179,14 +172,15 @@ def build_ann(input_dim: int, num_classes: int = 7, hidden=128, dropout=0.2, lr=
     )
     return model
 
-def train_ann(X_train, y_train, X_val, y_val, epochs=12, batch_size=128, hidden=128, dropout=0.2, lr=1e-3):
+def train_ann(X_train, y_train, X_val, y_val, epochs=12, batch_size=128, hidden=128, dropout=0.2, lr=1e-3, class_weight=None):
     model = build_ann(X_train.shape[1], len(EMOTIONS), hidden=hidden, dropout=dropout, lr=lr)
     hist = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=epochs,
         batch_size=batch_size,
-        verbose=0
+        verbose=0,
+        class_weight=class_weight  # <-- NEW
     )
     return model, hist.history
 
@@ -237,7 +231,6 @@ def plot_confusion_matrix(cm, title):
         xlabel="Predicted label",
         title=title
     )
-    # annotate counts
     thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
@@ -289,12 +282,13 @@ def run_app():
 **Classes:** no_emotion, anger, disgust, fear, happiness, sadness, surprise  
 **Embeddings:** GloVe (glove-wiki-gigaword) averaged per sentence  
 **Metrics:** Precision, Recall, F1, ROC-AUC (macro, micro)  
+**Imbalance:** Optional class weights for LR and ANN  
 """
         )
 
     # Path controls
     st.sidebar.header("Data path")
-    data_path = st.sidebar.text_input("dialogues.json path", DIALOGUES_JSON)
+    data_path = st.sidebar.text_input("dialogues.json path", str(DIALOGUES_JSON))
 
     # Data
     st.header("1) Load & Explore")
@@ -327,6 +321,15 @@ def run_app():
     X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=val_size, random_state=42, stratify=y_train_full)
     st.write(f"Train: {X_train.shape[0]} | Val: {X_val.shape[0]} | Test: {X_test.shape[0]}")
 
+    # Imbalance toggle + preview weights (NEW)
+    st.subheader("Imbalance handling")
+    use_weights = st.checkbox("Use class weights (recommended for imbalanced data)", value=True)
+    cw = get_class_weights(y_train) if use_weights else None
+    if use_weights:
+        # Show weights mapped to label names for clarity
+        pretty = {ID_TO_EMOTION[k]: f"{v:.2f}" for k, v in cw.items()}
+        st.caption(f"Class weights: {pretty}")
+
     # Train models
     st.header("4) Train Models")
     cl, cr = st.columns(2)
@@ -335,7 +338,8 @@ def run_app():
         c_val = st.number_input("C (inverse regularization)", min_value=0.01, max_value=10.0, value=2.0, step=0.25)
         if st.button("Train Logistic Regression"):
             with st.spinner("Training..."):
-                logreg = train_logreg(X_train, y_train, C=c_val)
+                # pass dict weights; if you prefer, use "balanced"
+                logreg = train_logreg(X_train, y_train, C=c_val, class_weight=(cw if use_weights else None))
             st.session_state["logreg"] = logreg
             st.success("Logistic Regression trained.")
     with cr:
@@ -346,7 +350,11 @@ def run_app():
         drop = st.slider("Dropout", 0.0, 0.8, 0.2, 0.05)
         if st.button("Train ANN"):
             with st.spinner("Training..."):
-                ann, hist = train_ann(X_train, y_train, X_val, y_val, epochs=epochs, batch_size=batch, hidden=hidden, dropout=drop)
+                ann, hist = train_ann(
+                    X_train, y_train, X_val, y_val,
+                    epochs=epochs, batch_size=batch, hidden=hidden, dropout=drop,
+                    class_weight=(cw if use_weights else None)
+                )
             st.session_state["ann"] = ann
             st.session_state["ann_hist"] = hist
             st.success("ANN trained.")
@@ -427,13 +435,11 @@ def run_app():
     col_i, col_t = st.columns([3, 20])
     with col_i:
         try:
-            st.image(str(icon_path), width=ICON_SIZE)  # small icon
+            st.image(str(icon_path), width=ICON_SIZE)
         except Exception:
-            st.write("")  # ignore if missing
+            st.write("")
     with col_t:
         st.caption("hallelujah!!! 🙌🙌🙌.")
-
-
 
 # -----------------------------
 # CLI Trainer
@@ -446,9 +452,13 @@ def run_cli():
 
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
+    # Compute class weights for training (NEW)
+    cw = get_class_weights(ytr)
+    print("Class weights:", cw)
+
     # Logistic Regression
     print("Training Logistic Regression...")
-    lr = train_logreg(Xtr, ytr, C=2.0)
+    lr = train_logreg(Xtr, ytr, C=2.0, class_weight=cw)  # <-- pass weights
     yprob_lr = lr.predict_proba(Xte)
     ypred_lr = np.argmax(yprob_lr, axis=1)
     rep_lr = classification_report(yte, ypred_lr, target_names=EMOTIONS, zero_division=0, output_dict=True)
@@ -459,7 +469,9 @@ def run_cli():
 
     # ANN
     print("Training ANN...")
-    ann, _ = train_ann(Xtr, ytr, Xte[:len(Xte)//5], yte[:len(yte)//5], epochs=12, batch_size=128)
+    # Use a small slice of test as val; or carve a real val set if you prefer
+    ann, _ = train_ann(Xtr, ytr, Xte[:len(Xte)//5], yte[:len(yte)//5],
+                       epochs=12, batch_size=128, class_weight=cw)  # <-- pass weights
     yprob_nn = ann.predict(Xte, verbose=0)
     ypred_nn = np.argmax(yprob_nn, axis=1)
     rep_nn = classification_report(yte, ypred_nn, target_names=EMOTIONS, zero_division=0, output_dict=True)
