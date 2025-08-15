@@ -20,7 +20,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix,
     roc_auc_score, roc_curve, auc
 )
-from sklearn.utils.class_weight import compute_class_weight  # imbalanced handling
+from sklearn.utils.class_weight import compute_class_weight  # imbalance handling
 import joblib
 
 # Plots
@@ -133,13 +133,37 @@ def load_dailydialog_local(json_path: str = DIALOGUES_JSON) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 # -----------------------------
-# Imbalance helpers (NEW)
+# Imbalance helpers
 # -----------------------------
 def get_class_weights(y_train):
     """Compute sklearn-style class weights as a dict {class_id: weight}."""
     classes = np.unique(y_train)
     weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
     return {int(c): float(w) for c, w in zip(classes, weights)}
+
+def undersample_majority(X, y, majority_class=0, k=1.5, random_state=42):
+    """
+    Keep all minority examples. Cap the majority class at k × the largest minority count.
+    k=1.0 makes majority equal to the largest minority size.
+    Only use this on the training split.
+    """
+    rng = np.random.default_rng(random_state)
+    y = np.asarray(y)
+
+    counts = np.bincount(y, minlength=len(EMOTIONS))
+    minority_counts = [counts[i] for i in range(len(EMOTIONS)) if i != majority_class]
+    if not minority_counts:
+        return X, y
+
+    cap = int(k * max(minority_counts))
+    maj_idx = np.where(y == majority_class)[0]
+    keep_maj = rng.choice(maj_idx, size=min(cap, len(maj_idx)), replace=False)
+
+    keep_min = np.where(y != majority_class)[0]
+    keep = np.concatenate([keep_maj, keep_min])
+    keep.sort()
+
+    return X[keep], y[keep]
 
 # -----------------------------
 # Models
@@ -151,7 +175,7 @@ def train_logreg(X_train, y_train, C=2.0, max_iter=2000, random_state=42, class_
         multi_class="multinomial",
         solver="lbfgs",
         random_state=random_state,
-        class_weight=class_weight  # <-- NEW
+        class_weight=class_weight
     )
     clf.fit(X_train, y_train)
     return clf
@@ -180,7 +204,7 @@ def train_ann(X_train, y_train, X_val, y_val, epochs=12, batch_size=128, hidden=
         epochs=epochs,
         batch_size=batch_size,
         verbose=0,
-        class_weight=class_weight  # <-- NEW
+        class_weight=class_weight
     )
     return model, hist.history
 
@@ -273,7 +297,7 @@ def predict_with_glove(text: str, model, glove_dim=100):
 def run_app():
     st.set_page_config(page_title="DailyDialog Emotion Classifier (Local JSON)", layout="wide")
     st.title("DailyDialog Emotion Detection • GloVe + LR / ANN")
-    st.caption(" A JSON data in ./data/dialogues.json, Comparing Logistic Regression and ANN.")
+    st.caption("A JSON data in ./data/dialogues.json. Comparing Logistic Regression and ANN.")
 
     with st.expander("Page Info"):
         st.markdown(
@@ -282,7 +306,7 @@ def run_app():
 **Classes:** no_emotion, anger, disgust, fear, happiness, sadness, surprise  
 **Embeddings:** GloVe (glove-wiki-gigaword) averaged per sentence  
 **Metrics:** Precision, Recall, F1, ROC-AUC (macro, micro)  
-**Imbalance:** Optional class weights for LR and ANN  
+**Imbalance:** Class weights and optional undersampling of `no_emotion`  
 """
         )
 
@@ -317,18 +341,29 @@ def run_app():
     st.header("3) Train / Val / Test Split")
     test_size = st.slider("Test size", 0.1, 0.3, 0.2, 0.05)
     val_size = st.slider("Validation size (from train)", 0.05, 0.2, 0.1, 0.05)
-    X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
-    X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=val_size, random_state=42, stratify=y_train_full)
+    X_train_full, X_test, y_train_full, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=42, stratify=y
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_full, y_train_full, test_size=val_size, random_state=42, stratify=y_train_full
+    )
     st.write(f"Train: {X_train.shape[0]} | Val: {X_val.shape[0]} | Test: {X_test.shape[0]}")
 
-    # Imbalance toggle + preview weights (NEW)
+    # Imbalance handling
     st.subheader("Imbalance handling")
-    use_weights = st.checkbox("Use class weights (recommended for imbalanced data)", value=True)
+    use_weights = st.checkbox("Use class weights (recommended)", value=True)
     cw = get_class_weights(y_train) if use_weights else None
     if use_weights:
-        # Show weights mapped to label names for clarity
         pretty = {ID_TO_EMOTION[k]: f"{v:.2f}" for k, v in cw.items()}
         st.caption(f"Class weights: {pretty}")
+
+    use_under = st.checkbox("Undersample 'no_emotion' in training", value=False)
+    k_ratio = st.slider("Cap no_emotion at k × largest minority", 1.0, 3.0, 1.5, 0.5)
+
+    X_tr_bal, y_tr_bal = (X_train, y_train)
+    if use_under:
+        X_tr_bal, y_tr_bal = undersample_majority(X_train, y_train, majority_class=0, k=k_ratio)
+        st.caption(f"After undersampling: Train = {len(y_tr_bal)} (no_emotion capped at ~{k_ratio}× largest minority)")
 
     # Train models
     st.header("4) Train Models")
@@ -338,8 +373,7 @@ def run_app():
         c_val = st.number_input("C (inverse regularization)", min_value=0.01, max_value=10.0, value=2.0, step=0.25)
         if st.button("Train Logistic Regression"):
             with st.spinner("Training..."):
-                # pass dict weights; if you prefer, use "balanced"
-                logreg = train_logreg(X_train, y_train, C=c_val, class_weight=(cw if use_weights else None))
+                logreg = train_logreg(X_tr_bal, y_tr_bal, C=c_val, class_weight=(cw if use_weights else None))
             st.session_state["logreg"] = logreg
             st.success("Logistic Regression trained.")
     with cr:
@@ -351,7 +385,7 @@ def run_app():
         if st.button("Train ANN"):
             with st.spinner("Training..."):
                 ann, hist = train_ann(
-                    X_train, y_train, X_val, y_val,
+                    X_tr_bal, y_tr_bal, X_val, y_val,
                     epochs=epochs, batch_size=batch, hidden=hidden, dropout=drop,
                     class_weight=(cw if use_weights else None)
                 )
@@ -386,6 +420,19 @@ def run_app():
                 c3.metric("Macro Recall", f"{metrics['report']['macro avg']['recall']:.3f}")
                 st.metric("ROC-AUC (macro)", f"{metrics['auc_macro']:.3f}" if not np.isnan(metrics["auc_macro"]) else "N/A")
                 st.metric("ROC-AUC (micro)", f"{metrics['auc_micro']:.3f}" if not np.isnan(metrics["auc_micro"]) else "N/A")
+
+                # Extra: metric excluding no_emotion
+                mask = (y_test != 0)
+                if mask.any():
+                    y_pred_full = np.argmax(metrics["y_prob"], axis=1)
+                    labels_no0 = [1, 2, 3, 4, 5, 6]
+                    names_no0 = [ID_TO_EMOTION[i] for i in labels_no0]
+                    rep_no0 = classification_report(
+                        y_test[mask], y_pred_full[mask],
+                        labels=labels_no0, target_names=names_no0,
+                        zero_division=0, output_dict=True
+                    )
+                    st.metric("Macro F1 (excluding no_emotion)", f"{rep_no0['macro avg']['f1-score']:.3f}")
 
                 # Report
                 rep_df = pd.DataFrame(metrics["report"]).T
@@ -429,7 +476,7 @@ def run_app():
                 st.bar_chart(pd.Series(probs, index=EMOTIONS))
 
     # Final caption with icon (JPEG)
-    icon_path = DATA_DIR / "2.jpg"  # Sabi
+    icon_path = DATA_DIR / "2.jpg"
     ICON_SIZE = 96
 
     col_i, col_t = st.columns([3, 20])
@@ -452,13 +499,17 @@ def run_cli():
 
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-    # Compute class weights for training (NEW)
+    # Compute class weights
     cw = get_class_weights(ytr)
     print("Class weights:", cw)
 
+    # Optional undersampling in CLI as well (fixed k=1.5 for consistency)
+    Xtr_bal, ytr_bal = undersample_majority(Xtr, ytr, majority_class=0, k=1.5)
+    print(f"CLI undersampling: train size {len(ytr)} -> {len(ytr_bal)}")
+
     # Logistic Regression
     print("Training Logistic Regression...")
-    lr = train_logreg(Xtr, ytr, C=2.0, class_weight=cw)  # <-- pass weights
+    lr = train_logreg(Xtr_bal, ytr_bal, C=2.0, class_weight=cw)
     yprob_lr = lr.predict_proba(Xte)
     ypred_lr = np.argmax(yprob_lr, axis=1)
     rep_lr = classification_report(yte, ypred_lr, target_names=EMOTIONS, zero_division=0, output_dict=True)
@@ -469,9 +520,7 @@ def run_cli():
 
     # ANN
     print("Training ANN...")
-    # Use a small slice of test as val; or carve a real val set if you prefer
-    ann, _ = train_ann(Xtr, ytr, Xte[:len(Xte)//5], yte[:len(yte)//5],
-                       epochs=12, batch_size=128, class_weight=cw)  # <-- pass weights
+    ann, _ = train_ann(Xtr_bal, ytr_bal, Xte[:len(Xte)//5], yte[:len(yte)//5], epochs=12, batch_size=128, class_weight=cw)
     yprob_nn = ann.predict(Xte, verbose=0)
     ypred_nn = np.argmax(yprob_nn, axis=1)
     rep_nn = classification_report(yte, ypred_nn, target_names=EMOTIONS, zero_division=0, output_dict=True)
@@ -493,7 +542,6 @@ if __name__ == "__main__":
     if args.train_cli:
         run_cli()
     else:
-        # Let Streamlit take over when run via `streamlit run`.
         try:
             run_app()
         except SystemExit:
